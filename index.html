@@ -149,6 +149,8 @@
       const [currentUser, setCurrentUser] = useState(null);
       const [authLoading, setAuthLoading] = useState(true);
       const [unauthorizedEmail, setUnauthorizedEmail] = useState(null);
+      const [loginError, setLoginError] = useState(null);
+      const [isLoggingIn, setIsLoggingIn] = useState(false);
 
       const [stocks, setStocks] = useState(INITIAL_STOCKS);
       const [schedules, setSchedules] = useState(INITIAL_SCHEDULES);
@@ -159,6 +161,7 @@
       const [filterHouse, setFilterHouse] = useState('ALL');
       const [replaceModal, setReplaceModal] = useState(null);
       const [transferModal, setTransferModal] = useState(null);
+      const [stockFormModal, setStockFormModal] = useState(null); // { mode: 'create' | 'edit', data: {...} }
       const [toast, setToast] = useState(null);
 
       const showToast = (msg, type = 'success') => {
@@ -175,45 +178,82 @@
           return;
         }
 
+        // 處理 Redirect 轉址登入返回時的錯誤或結果
+        auth.getRedirectResult().catch((err) => {
+          console.error("Redirect login error:", err);
+          if (err && err.code) {
+            setLoginError(`轉址登入異常 (${err.code})：${err.message}`);
+          }
+          setIsLoggingIn(false);
+        });
+
         const unsubscribeAuth = auth.onAuthStateChanged(async (user) => {
           if (user) {
             const normalizedList = ALLOWED_EMAILS.map(e => e.trim().toLowerCase());
             const userEmail = (user.email || "").trim().toLowerCase();
-            // 若尚未修改預設範例信箱，暫時放行並顯示設定提醒；一旦填入真實信箱則嚴格執行白名單比對
-            const isPlaceholder = normalizedList.length === 1 && normalizedList[0] === "wx9950a@gmail.com";
-            
-            if (!isPlaceholder && !normalizedList.includes(userEmail)) {
+            // 嚴格執行白名單比對
+            if (!normalizedList.includes(userEmail)) {
               setUnauthorizedEmail(user.email);
               await auth.signOut();
               setCurrentUser(null);
               setAuthLoading(false);
+              setIsLoggingIn(false);
               return;
             }
             setUnauthorizedEmail(null);
+            setLoginError(null);
           }
           setCurrentUser(user);
           setAuthLoading(false);
+          setIsLoggingIn(false);
         });
 
         return () => unsubscribeAuth();
       }, []);
 
-      // Google 登入處理 (支援行動裝置 Popup 或 Redirect)
-      const handleGoogleLogin = async () => {
+      // Google 登入處理 (行動裝置 / PWA 自動走 Redirect 避免快閃視窗被擋，桌機走 Popup)
+      const handleGoogleLogin = async (forceRedirect = false) => {
         if (!auth || !googleProvider) {
-          showToast("Firebase Auth 尚未就緒", "error");
+          setLoginError("Firebase Auth 尚未就緒");
           return;
         }
         setUnauthorizedEmail(null);
+        setLoginError(null);
+        setIsLoggingIn(true);
+
+        const isMobileOrStandalone = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || 
+                                     window.matchMedia('(display-mode: standalone)').matches;
+
+        if (forceRedirect || isMobileOrStandalone) {
+          try {
+            await auth.signInWithRedirect(googleProvider);
+          } catch (err) {
+            console.error("Redirect trigger error:", err);
+            setLoginError(`無法啟動轉址登入 (${err.code}): ${err.message}`);
+            setIsLoggingIn(false);
+          }
+          return;
+        }
+
         try {
           await auth.signInWithPopup(googleProvider);
         } catch (err) {
-          console.error("Google login error:", err);
-          if (err.code === "auth/popup-blocked" || err.code === "auth/popup-closed-by-user") {
-            // 若手機瀏覽器封鎖彈窗，改採轉址登入
-            auth.signInWithRedirect(googleProvider);
+          console.error("Google popup login error:", err);
+          if (
+            err.code === "auth/popup-blocked" ||
+            err.code === "auth/popup-closed-by-user" ||
+            err.code === "auth/cancelled-popup-request"
+          ) {
+            // 瀏覽器阻擋快閃視窗時，自動無縫切換為同頁轉址登入
+            try {
+              await auth.signInWithRedirect(googleProvider);
+            } catch (redErr) {
+              setLoginError(`轉址登入失敗: ${redErr.message}`);
+              setIsLoggingIn(false);
+            }
           } else {
-            showToast(`登入失敗: ${err.message}`, "error");
+            setLoginError(`登入錯誤 (${err.code || 'unknown'}): ${err.message}`);
+            setIsLoggingIn(false);
           }
         }
       };
@@ -252,7 +292,8 @@
           }
         }, (err) => {
           console.error("Firestore stocks sync error:", err);
-          setSyncStatus('local');
+          setSyncStatus('error');
+          showToast(`Firestore 連線失敗 (${err.code})，請確認安全規則已部署`, 'error');
         });
 
         // 監聽 2: 排程清單 (schedules)
@@ -417,6 +458,82 @@
         }
       };
 
+      // =========================================================================
+      // 6. 新增 / 修改 / 刪除庫存項目 (即時同步 Firestore)
+      // =========================================================================
+      const handleSaveStock = async (formData) => {
+        const name = (formData.name || '').trim();
+        if (!name) {
+          showToast('請輸入濾心品項名稱', 'error');
+          return;
+        }
+
+        const spec = (formData.spec || '').trim();
+        const unit = (formData.unit || '支').trim() || '支';
+        const safety = Math.max(0, parseInt(formData.safety, 10) || 0);
+        const central = Math.max(0, parseInt(formData.central, 10) || 0);
+        const locations = {
+          jiao: Math.max(0, parseInt(formData.jiao, 10) || 0),
+          haitian: Math.max(0, parseInt(formData.haitian, 10) || 0),
+          suogang: Math.max(0, parseInt(formData.suogang, 10) || 0),
+          aunt: Math.max(0, parseInt(formData.aunt, 10) || 0),
+        };
+
+        if (syncStatus === 'online' && db) {
+          try {
+            if (formData.mode === 'create') {
+              const newId = 'STK_' + Date.now();
+              await db.collection('filter_stocks').doc(newId).set({
+                id: newId,
+                name,
+                spec,
+                unit,
+                central,
+                locations,
+                safety
+              });
+              showToast(`☁️ 已新增耗材「${name}」並同步至雲端`);
+            } else {
+              await db.collection('filter_stocks').doc(formData.id).update({
+                name,
+                spec,
+                unit,
+                central,
+                locations,
+                safety
+              });
+              showToast(`☁️ 已更新「${name}」庫存設定`);
+            }
+            setStockFormModal(null);
+          } catch (err) {
+            console.error("Save stock error:", err);
+            showToast(`儲存失敗: ${err.message}`, 'error');
+          }
+        } else {
+          showToast('雲端尚未連線，請稍候再試', 'error');
+        }
+      };
+
+      const handleDeleteStock = async (stk) => {
+        const linkedSchedules = schedules.filter(s => s.stockId === stk.id);
+        if (linkedSchedules.length > 0) {
+          showToast(`無法刪除：尚有 ${linkedSchedules.length} 筆維護排程綁定此耗材`, 'error');
+          return;
+        }
+        if (!window.confirm(`確定要刪除耗材「${stk.name}」嗎？此操作無法復原。`)) return;
+
+        if (syncStatus === 'online' && db) {
+          try {
+            await db.collection('filter_stocks').doc(stk.id).delete();
+            setStockFormModal(null);
+            showToast(`🗑️ 已刪除「${stk.name}」`);
+          } catch (err) {
+            console.error("Delete stock error:", err);
+            showToast(`刪除失敗: ${err.message}`, 'error');
+          }
+        }
+      };
+
       const filteredSchedules = useMemo(() => {
         return schedules
           .filter(s => filterHouse === 'ALL' || s.houseId === filterHouse)
@@ -460,24 +577,41 @@
                 </div>
               )}
 
+              {loginError && (
+                <div className="mb-4 p-3 rounded-xl bg-amber-50 border border-amber-200 text-left">
+                  <p className="text-xs font-bold text-amber-800">⚠️ 登入提示</p>
+                  <p className="text-[11px] text-amber-700 mt-1 break-all">{loginError}</p>
+                </div>
+              )}
+
               {/* Google 登入按鈕 */}
               <button
-                onClick={handleGoogleLogin}
-                className="w-full flex items-center justify-center gap-3 bg-white border border-slate-300 hover:border-slate-400 active:bg-slate-50 py-3 px-4 rounded-xl shadow-sm text-sm font-semibold text-slate-700 transition"
+                onClick={() => handleGoogleLogin(false)}
+                disabled={isLoggingIn}
+                className="w-full flex items-center justify-center gap-3 bg-white border border-slate-300 hover:border-slate-400 active:bg-slate-50 disabled:opacity-60 py-3 px-4 rounded-xl shadow-sm text-sm font-semibold text-slate-700 transition"
               >
-                <svg className="w-5 h-5" viewBox="0 0 24 24">
-                  <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.8-2.4 3.66v3.05h3.88c2.27-2.09 3.66-5.17 3.66-9.15z"/>
-                  <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.76-2.11-6.71-4.96H1.27v3.13C3.25 21.3 7.35 24 12 24z"/>
-                  <path fill="#FBBC05" d="M5.29 14.24c-.25-.72-.38-1.49-.38-2.24s.13-1.52.38-2.24V6.63H1.27C.46 8.24 0 10.06 0 12s.46 3.76 1.27 5.37l4.02-3.13z"/>
-                  <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.35 0 3.25 2.7 1.27 6.63l4.02 3.13c.95-2.85 3.59-4.96 6.71-4.96z"/>
-                </svg>
-                <span>使用 Google 帳號登入</span>
+                {isLoggingIn ? (
+                  <span className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></span>
+                ) : (
+                  <svg className="w-5 h-5" viewBox="0 0 24 24">
+                    <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.8-2.4 3.66v3.05h3.88c2.27-2.09 3.66-5.17 3.66-9.15z"/>
+                    <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.76-2.11-6.71-4.96H1.27v3.13C3.25 21.3 7.35 24 12 24z"/>
+                    <path fill="#FBBC05" d="M5.29 14.24c-.25-.72-.38-1.49-.38-2.24s.13-1.52.38-2.24V6.63H1.27C.46 8.24 0 10.06 0 12s.46 3.76 1.27 5.37l4.02-3.13z"/>
+                    <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.35 0 3.25 2.7 1.27 6.63l4.02 3.13c.95-2.85 3.59-4.96 6.71-4.96z"/>
+                  </svg>
+                )}
+                <span>{isLoggingIn ? "正在導向 Google 驗證..." : "使用 Google 帳號登入"}</span>
               </button>
 
-              <div className="mt-6 pt-4 border-t border-slate-100 flex items-center justify-center gap-2 text-[11px] text-slate-400">
-                <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-                <span>Firestore Cloud AES-256 加密保護</span>
-              </div>
+              <button
+                onClick={() => handleGoogleLogin(true)}
+                disabled={isLoggingIn}
+                className="mt-3 text-[11px] text-blue-600 hover:underline font-medium"
+              >
+                若彈窗無反應，點此改用同頁轉址登入
+              </button>
+
+
             </div>
           </div>
         );
@@ -496,10 +630,11 @@
                 <div className="flex items-center gap-1.5 mt-0.5">
                   <span className={`inline-block w-2 h-2 rounded-full ${
                     syncStatus === 'online' ? 'bg-emerald-400 animate-pulse' :
-                    syncStatus === 'connecting' ? 'bg-amber-400' : 'bg-slate-400'
+                    syncStatus === 'error' ? 'bg-rose-500' : 'bg-amber-400'
                   }`} />
                   <p className="text-[11px] text-slate-300">
-                    {syncStatus === 'online' ? 'Firestore 雲端同步中' : '連線中...'}
+                    {syncStatus === 'online' ? 'Firestore 雲端已連線 (roy-waterfilter)' :
+                     syncStatus === 'error' ? 'Firestore 權限被拒 (請部署 rules)' : '雲端連線中...'}
                   </p>
                 </div>
               </div>
@@ -542,16 +677,6 @@
               </div>
             </div>
           </header>
-
-          {/* 白名單尚未設定提醒橫幅 */}
-          {ALLOWED_EMAILS.length === 1 && ALLOWED_EMAILS[0] === "wx9950a@gmail.com" && (
-            <div className="bg-amber-50 border-b border-amber-200 px-3 py-2 text-[11px] text-amber-800 flex items-start gap-1.5">
-              <span>⚠️</span>
-              <span>
-                <strong>安全提醒：</strong>目前白名單仍為預設範例，請將 <code className="bg-amber-100 px-1 rounded">index.html</code> 與 <code className="bg-amber-100 px-1 rounded">firestore.rules</code> 中的 <code className="bg-amber-100 px-1 rounded">wx9950a@gmail.com</code> 替換為你的 Gmail（<span className="underline font-semibold">{currentUser.email}</span>）。
-              </span>
-            </div>
-          )}
 
           {/* Toast 提示 */}
           {toast && (
@@ -666,12 +791,23 @@
             {activeTab === 'stock' && (
               <div className="space-y-3">
                 <div className="flex justify-between items-center mb-1">
-                  <h2 className="text-sm font-bold text-slate-700">各據點耗材庫存池</h2>
-                  <span className="text-xs text-slate-400">共 {stocks.length} 款耗材</span>
+                  <div>
+                    <h2 className="text-sm font-bold text-slate-700">各據點耗材庫存池</h2>
+                    <span className="text-[11px] text-slate-400">共 {stocks.length} 款耗材</span>
+                  </div>
+                  <button
+                    onClick={() => setStockFormModal({
+                      mode: 'create',
+                      data: { name: '', spec: '', unit: '支', safety: 2, central: 0, jiao: 0, haitian: 0, suogang: 0, aunt: 0 }
+                    })}
+                    className="bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white px-3 py-1.5 rounded-lg text-xs font-bold shadow-sm flex items-center gap-1 transition"
+                  >
+                    <span>＋ 新增耗材</span>
+                  </button>
                 </div>
 
                 {stocks.map(stk => {
-                  const total = stk.central + Object.values(stk.locations).reduce((a, b) => a + b, 0);
+                  const total = stk.central + Object.values(stk.locations || {}).reduce((a, b) => a + b, 0);
                   const isLow = total < stk.safety;
 
                   return (
@@ -679,7 +815,7 @@
                       <div className="flex justify-between items-start mb-2">
                         <div>
                           <h3 className="font-bold text-slate-800 text-sm">{stk.name}</h3>
-                          <p className="text-xs text-slate-400">{stk.spec}</p>
+                          <p className="text-xs text-slate-400">{stk.spec || '無規格備註'}</p>
                         </div>
                         <div className="text-right">
                           <span className={`text-base font-extrabold ${isLow ? 'text-rose-600' : 'text-slate-800'}`}>
@@ -699,85 +835,53 @@
                         </div>
                         <div className="border-r border-slate-200">
                           <span className="text-slate-400 block text-[10px]">交響樂</span>
-                          <span className="font-bold text-slate-700">{stk.locations.jiao || 0}</span>
+                          <span className="font-bold text-slate-700">{stk.locations?.jiao || 0}</span>
                         </div>
                         <div className="border-r border-slate-200">
                           <span className="text-slate-400 block text-[10px]">海天</span>
-                          <span className="font-bold text-slate-700">{stk.locations.haitian || 0}</span>
+                          <span className="font-bold text-slate-700">{stk.locations?.haitian || 0}</span>
                         </div>
                         <div className="border-r border-slate-200">
                           <span className="text-slate-400 block text-[10px]">鎖港</span>
-                          <span className="font-bold text-slate-700">{stk.locations.suogang || 0}</span>
+                          <span className="font-bold text-slate-700">{stk.locations?.suogang || 0}</span>
                         </div>
                         <div>
                           <span className="text-slate-400 block text-[10px]">阿姨家</span>
-                          <span className="font-bold text-slate-700">{stk.locations.aunt || 0}</span>
+                          <span className="font-bold text-slate-700">{stk.locations?.aunt || 0}</span>
                         </div>
                       </div>
 
-                      <button
-                        onClick={() => setTransferModal(stk)}
-                        className="w-full bg-blue-50 text-blue-700 hover:bg-blue-100 py-1.5 rounded-lg text-xs font-medium border border-blue-200 flex items-center justify-center gap-1"
-                      >
-                        <span>⇄ 移動 / 調撥庫存</span>
-                      </button>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          onClick={() => setTransferModal(stk)}
+                          className="bg-blue-50 text-blue-700 hover:bg-blue-100 py-1.5 rounded-lg text-xs font-medium border border-blue-200 flex items-center justify-center gap-1"
+                        >
+                          <span>⇄ 調撥移動</span>
+                        </button>
+                        <button
+                          onClick={() => setStockFormModal({
+                            mode: 'edit',
+                            data: {
+                              id: stk.id,
+                              name: stk.name,
+                              spec: stk.spec || '',
+                              unit: stk.unit || '支',
+                              safety: stk.safety ?? 0,
+                              central: stk.central ?? 0,
+                              jiao: stk.locations?.jiao ?? 0,
+                              haitian: stk.locations?.haitian ?? 0,
+                              suogang: stk.locations?.suogang ?? 0,
+                              aunt: stk.locations?.aunt ?? 0
+                            }
+                          })}
+                          className="bg-slate-100 text-slate-700 hover:bg-slate-200 py-1.5 rounded-lg text-xs font-medium border border-slate-200 flex items-center justify-center gap-1"
+                        >
+                          <span>✏️ 編輯數量/規格</span>
+                        </button>
+                      </div>
                     </div>
                   );
                 })}
-              </div>
-            )}
-
-            {/* TAB 3: 澎湖返鄉備料智慧清單 */}
-            {activeTab === 'penghu' && (
-              <div className="space-y-3">
-                <div className="bg-blue-900 text-white p-4 rounded-xl shadow-sm">
-                  <h2 className="font-bold text-base flex items-center gap-1.5">
-                    <span>✈️</span> 澎湖返鄉備料試算
-                  </h2>
-                  <p className="text-xs text-blue-200 mt-1">
-                    自動分析 2027年2月底前 澎湖鎖港與阿姨家到期的濾芯，扣除現場存量，計算需從本島攜帶的數量。
-                  </p>
-                </div>
-
-                <div className="bg-white rounded-xl p-3 border border-slate-200 space-y-2">
-                  <div className="text-xs font-bold text-slate-700 pb-1 border-b border-slate-100 flex justify-between">
-                    <span>品項規格</span>
-                    <span>建議攜帶總數</span>
-                  </div>
-
-                  {stocks.filter(s => ['STK_PP5', 'STK_CTO2X', 'STK_ST_COCO', 'STK_ST_CARB', 'STK_ST_MIN', 'STK_RO_MEM'].includes(s.id)).map(stk => {
-                    const targetDate = new Date('2027-02-28');
-                    let needTotal = 0;
-                    schedules.forEach(sch => {
-                      if ((sch.houseId === 'suogang' || sch.houseId === 'aunt') && sch.stockId === stk.id) {
-                        if (new Date(sch.nextDate) <= targetDate) {
-                          needTotal += sch.batchQty;
-                        }
-                      }
-                    });
-
-                    const localTotal = (stk.locations.suogang || 0) + (stk.locations.aunt || 0);
-                    const carryNeeded = Math.max(0, needTotal - localTotal);
-
-                    return (
-                      <div key={stk.id} className="flex justify-between items-center py-1.5 border-b border-slate-50 text-xs">
-                        <div>
-                          <span className="font-semibold text-slate-800">{stk.name}</span>
-                          <span className="text-[10px] text-slate-400 block">
-                            兩屋需換 {needTotal} 支 · 現場存 {localTotal} 支
-                          </span>
-                        </div>
-                        <div className="text-right">
-                          <span className={`text-sm font-bold px-2 py-0.5 rounded ${
-                            carryNeeded > 0 ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-500'
-                          }`}>
-                            帶 {carryNeeded} {stk.unit}
-                          </span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
               </div>
             )}
 
@@ -954,11 +1058,150 @@
             </div>
           )}
 
+          {/* 彈窗 3: 新增 / 編輯耗材庫存 Modal */}
+          {stockFormModal && (
+            <div className="fixed inset-0 bg-black/60 z-50 flex items-end sm:items-center justify-center p-3 overflow-y-auto">
+              <div className="bg-white w-full max-w-sm rounded-2xl p-4 space-y-3 shadow-2xl my-auto">
+                <div className="flex justify-between items-center border-b pb-2">
+                  <h3 className="font-bold text-slate-800 text-base">
+                    {stockFormModal.mode === 'create' ? '➕ 新增耗材項目' : '✏️ 編輯耗材與庫存'}
+                  </h3>
+                  <button onClick={() => setStockFormModal(null)} className="text-slate-400 hover:text-slate-600 text-lg">✕</button>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="col-span-2">
+                    <label className="text-[11px] font-semibold text-slate-600 block mb-1">品項名稱 *</label>
+                    <input
+                      type="text"
+                      value={stockFormModal.data.name}
+                      onChange={(e) => setStockFormModal({ ...stockFormModal, data: { ...stockFormModal.data, name: e.target.value } })}
+                      placeholder="如：10吋樹脂軟水濾心"
+                      className="w-full text-xs p-2 bg-slate-50 border border-slate-300 rounded-lg font-semibold"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[11px] font-semibold text-slate-600 block mb-1">計量單位</label>
+                    <input
+                      type="text"
+                      value={stockFormModal.data.unit}
+                      onChange={(e) => setStockFormModal({ ...stockFormModal, data: { ...stockFormModal.data, unit: e.target.value } })}
+                      placeholder="支/片/組"
+                      className="w-full text-xs p-2 bg-slate-50 border border-slate-300 rounded-lg text-center"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="col-span-2">
+                    <label className="text-[11px] font-semibold text-slate-600 block mb-1">規格說明</label>
+                    <input
+                      type="text"
+                      value={stockFormModal.data.spec}
+                      onChange={(e) => setStockFormModal({ ...stockFormModal, data: { ...stockFormModal.data, spec: e.target.value } })}
+                      placeholder="如：10吋標準公規"
+                      className="w-full text-xs p-2 bg-slate-50 border border-slate-300 rounded-lg"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[11px] font-semibold text-slate-600 block mb-1">安全水位</label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={stockFormModal.data.safety}
+                      onChange={(e) => setStockFormModal({ ...stockFormModal, data: { ...stockFormModal.data, safety: e.target.value } })}
+                      className="w-full text-xs p-2 bg-slate-50 border border-slate-300 rounded-lg font-bold text-center"
+                    />
+                  </div>
+                </div>
+
+                <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-200 space-y-2">
+                  <p className="text-[11px] font-bold text-slate-700">各地點現有數量盤點：</p>
+                  <div className="grid grid-cols-3 gap-2 text-center">
+                    <div>
+                      <label className="text-[10px] text-slate-500 block mb-0.5">待入庫(中央)</label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={stockFormModal.data.central}
+                        onChange={(e) => setStockFormModal({ ...stockFormModal, data: { ...stockFormModal.data, central: e.target.value } })}
+                        className="w-full text-xs p-1.5 bg-white border border-slate-300 rounded text-center font-bold"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] text-slate-500 block mb-0.5">交響樂</label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={stockFormModal.data.jiao}
+                        onChange={(e) => setStockFormModal({ ...stockFormModal, data: { ...stockFormModal.data, jiao: e.target.value } })}
+                        className="w-full text-xs p-1.5 bg-white border border-slate-300 rounded text-center font-bold"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] text-slate-500 block mb-0.5">海天</label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={stockFormModal.data.haitian}
+                        onChange={(e) => setStockFormModal({ ...stockFormModal, data: { ...stockFormModal.data, haitian: e.target.value } })}
+                        className="w-full text-xs p-1.5 bg-white border border-slate-300 rounded text-center font-bold"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] text-slate-500 block mb-0.5">澎湖鎖港</label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={stockFormModal.data.suogang}
+                        onChange={(e) => setStockFormModal({ ...stockFormModal, data: { ...stockFormModal.data, suogang: e.target.value } })}
+                        className="w-full text-xs p-1.5 bg-white border border-slate-300 rounded text-center font-bold"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] text-slate-500 block mb-0.5">澎湖阿姨家</label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={stockFormModal.data.aunt}
+                        onChange={(e) => setStockFormModal({ ...stockFormModal, data: { ...stockFormModal.data, aunt: e.target.value } })}
+                        className="w-full text-xs p-1.5 bg-white border border-slate-300 rounded text-center font-bold"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex gap-2 pt-1">
+                  {stockFormModal.mode === 'edit' && (
+                    <button
+                      onClick={() => handleDeleteStock(stockFormModal.data)}
+                      className="px-3 py-2.5 rounded-lg bg-rose-50 text-rose-600 border border-rose-200 text-xs font-semibold hover:bg-rose-100"
+                    >
+                      刪除
+                    </button>
+                  )}
+                  <button
+                    onClick={() => setStockFormModal(null)}
+                    className="flex-1 py-2.5 rounded-lg border border-slate-200 text-xs font-medium text-slate-600"
+                  >
+                    取消
+                  </button>
+                  <button
+                    onClick={() => handleSaveStock(stockFormModal.data)}
+                    className="flex-1 py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-md"
+                  >
+                    儲存並同步雲端
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* 底部導航列 (Bottom Navigation) */}
           <nav className="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-white border-t border-slate-200 flex justify-around py-2 z-40 shadow-lg">
             <button
               onClick={() => setActiveTab('schedule')}
-              className={`flex flex-col items-center gap-0.5 text-[10px] font-medium transition ${
+              className={`flex-1 flex flex-col items-center gap-0.5 text-[10px] font-medium transition ${
                 activeTab === 'schedule' ? 'text-blue-600 font-bold' : 'text-slate-400'
               }`}
             >
@@ -967,7 +1210,7 @@
             </button>
             <button
               onClick={() => setActiveTab('stock')}
-              className={`flex flex-col items-center gap-0.5 text-[10px] font-medium transition ${
+              className={`flex-1 flex flex-col items-center gap-0.5 text-[10px] font-medium transition ${
                 activeTab === 'stock' ? 'text-blue-600 font-bold' : 'text-slate-400'
               }`}
             >
@@ -975,17 +1218,8 @@
               <span>耗材庫存</span>
             </button>
             <button
-              onClick={() => setActiveTab('penghu')}
-              className={`flex flex-col items-center gap-0.5 text-[10px] font-medium transition ${
-                activeTab === 'penghu' ? 'text-blue-600 font-bold' : 'text-slate-400'
-              }`}
-            >
-              <span className="text-lg">✈️</span>
-              <span>澎湖備料</span>
-            </button>
-            <button
               onClick={() => setActiveTab('history')}
-              className={`flex flex-col items-center gap-0.5 text-[10px] font-medium transition ${
+              className={`flex-1 flex flex-col items-center gap-0.5 text-[10px] font-medium transition ${
                 activeTab === 'history' ? 'text-blue-600 font-bold' : 'text-slate-400'
               }`}
             >
