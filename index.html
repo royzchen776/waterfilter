@@ -1,0 +1,1003 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>四屋淨水設備與耗材雲端管理</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React & ReactDOM -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel for inline JSX -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Firebase App, Auth & Firestore (Compat CDN for standalone single-file HTML) -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+  <style>
+    body {
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+    input, select, textarea {
+      user-select: auto;
+    }
+  </style>
+</head>
+<body class="bg-slate-100 text-slate-800 antialiased min-h-screen">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    // =========================================================================
+    // 1. Firebase 設定與初始化 (roy-waterfilter 專案)
+    // =========================================================================
+    const firebaseConfig = {
+      apiKey: "AIzaSyBPJi1KVBhuvWVJh-2JrSncGLI5lPRss9Y",
+      authDomain: "roy-waterfilter.firebaseapp.com",
+      projectId: "roy-waterfilter",
+      storageBucket: "roy-waterfilter.firebasestorage.app",
+      messagingSenderId: "851881067368",
+      appId: "1:851881067368:web:0383444460526097950cdd",
+      measurementId: "G-YY9LPMVP92"
+    };
+
+    // =========================================================================
+    // 1.5 Email 白名單設定 (填入允許存取的 Gmail 帳號，支援多個家族成員)
+    // =========================================================================
+    const ALLOWED_EMAILS = [
+      "wx9950a@gmail.com"
+      // 如需新增家人或共管帳號，請在下方加入，例如：
+      // "family.member@gmail.com"
+    ];
+
+    let db = null;
+    let auth = null;
+    let googleProvider = null;
+    let isFirebaseReady = false;
+
+    try {
+      if (!firebase.apps.length) {
+        firebase.initializeApp(firebaseConfig);
+      }
+      auth = firebase.auth();
+      googleProvider = new firebase.auth.GoogleAuthProvider();
+      // 設置自訂參數以強制彈出帳號選擇畫面
+      googleProvider.setCustomParameters({ prompt: 'select_account' });
+
+      db = firebase.firestore();
+      db.enablePersistence({ synchronizeTabs: true }).catch((err) => {
+        console.warn("Firestore offline persistence notice:", err.code);
+      });
+      isFirebaseReady = true;
+    } catch (e) {
+      console.error("Firebase init error:", e);
+    }
+
+    // --- 預設初始種子資料 (正規化結構) ---
+    const INITIAL_HOUSES = [
+      { id: 'jiao', name: '交響樂', group: '本島', notes: '全戶前置 + 廚下RO' },
+      { id: 'haitian', name: '海天', group: '本島', notes: '全戶前置 + 廚下RO' },
+      { id: 'suogang', name: '澎湖鎖港', group: '澎湖', notes: '廚下RO (含麥飯石)' },
+      { id: 'aunt', name: '澎湖阿姨家', group: '澎湖', notes: '廚下RO' }
+    ];
+
+    const INITIAL_STOCKS = [
+      { id: 'STK_BIG10', name: '10吋大胖', spec: '10吋大胖前置濾瓶', unit: '支', central: 6, locations: { jiao: 2, haitian: 2, suogang: 0, aunt: 1 }, safety: 4 },
+      { id: 'STK_PP5', name: 'PP-5', spec: '10吋標準 5微米 PP', unit: '支', central: 16, locations: { jiao: 5, haitian: 3, suogang: 0, aunt: 1 }, safety: 6 },
+      { id: 'STK_CTO2X', name: 'CTO-2X', spec: '10吋標準 壓縮活性碳 (雙道組)', unit: '支', central: 16, locations: { jiao: 4, haitian: 4, suogang: 2, aunt: 2 }, safety: 8 },
+      { id: 'STK_ST_COCO', name: 'ST椰殼', spec: '後置小T33 椰殼顆粒碳', unit: '支', central: 5, locations: { jiao: 0, haitian: 1, suogang: 1, aunt: 0 }, safety: 3 },
+      { id: 'STK_ST_CARB', name: 'ST活性碳', spec: '後置小T33 壓縮活性碳', unit: '支', central: 5, locations: { jiao: 0, haitian: 1, suogang: 1, aunt: 0 }, safety: 3 },
+      { id: 'STK_ST_MIN', name: 'ST麥飯石', spec: '後置小T33 麥飯石 (鎖港專用)', unit: '支', central: 2, locations: { jiao: 0, haitian: 0, suogang: 0, aunt: 0 }, safety: 1 },
+      { id: 'STK_RO_MEM', name: 'RO膜', spec: '50G/75G 逆滲透膜 (3年週期)', unit: '支', central: 1, locations: { jiao: 0, haitian: 0, suogang: 0, aunt: 0 }, safety: 1 },
+      { id: 'STK_LEAK_PAD', name: '漏水偵測棉', spec: '吸水膨脹止水棉片 (備品)', unit: '片', central: 2, locations: { jiao: 1, haitian: 1, suogang: 0, aunt: 0 }, safety: 2 },
+      { id: 'STK_VALVE', name: '逆止閥/廢水比', spec: 'RO膜專用配件 (備品)', unit: '組', central: 2, locations: { jiao: 0, haitian: 0, suogang: 0, aunt: 0 }, safety: 1 }
+    ];
+
+    const INITIAL_SCHEDULES = [
+      // 交響樂
+      { id: 'sch_1', houseId: 'jiao', houseName: '交響樂', device: '全戶前置', stage: '10吋大胖', stockId: 'STK_BIG10', batchQty: 1, cycleMonths: 3, lastDate: '2026-11-01', nextDate: '2027-02-01' },
+      { id: 'sch_2', houseId: 'jiao', houseName: '交響樂', device: '廚下RO 第1道', stage: 'PP-5', stockId: 'STK_PP5', batchQty: 1, cycleMonths: 3, lastDate: '2026-11-01', nextDate: '2027-02-01' },
+      { id: 'sch_3', houseId: 'jiao', houseName: '交響樂', device: '廚下RO 第2/3道', stage: 'CTO-2X', stockId: 'STK_CTO2X', batchQty: 2, cycleMonths: 6, lastDate: '2026-11-01', nextDate: '2027-05-01' },
+      { id: 'sch_4', houseId: 'jiao', houseName: '交響樂', device: '廚下RO 第5道', stage: 'ST椰殼', stockId: 'STK_ST_COCO', batchQty: 1, cycleMonths: 12, lastDate: '2026-11-01', nextDate: '2027-11-01' },
+      { id: 'sch_5', houseId: 'jiao', houseName: '交響樂', device: '廚下RO 第6道', stage: 'ST活性碳', stockId: 'STK_ST_CARB', batchQty: 1, cycleMonths: 12, lastDate: '2026-11-01', nextDate: '2027-11-01' },
+      { id: 'sch_6', houseId: 'jiao', houseName: '交響樂', device: '廚下RO 第4道', stage: 'RO膜', stockId: 'STK_RO_MEM', batchQty: 1, cycleMonths: 36, lastDate: '2026-02-01', nextDate: '2029-02-01' },
+      
+      // 海天
+      { id: 'sch_7', houseId: 'haitian', houseName: '海天', device: '全戶前置', stage: '10吋大胖', stockId: 'STK_BIG10', batchQty: 1, cycleMonths: 6, lastDate: '2026-08-01', nextDate: '2027-02-01' },
+      { id: 'sch_8', houseId: 'haitian', houseName: '海天', device: '廚下RO 第1道', stage: 'PP-5', stockId: 'STK_PP5', batchQty: 1, cycleMonths: 6, lastDate: '2026-08-01', nextDate: '2027-02-01' },
+      { id: 'sch_9', houseId: 'haitian', houseName: '海天', device: '廚下RO 第2/3道', stage: 'CTO-2X', stockId: 'STK_CTO2X', batchQty: 2, cycleMonths: 6, lastDate: '2026-08-01', nextDate: '2027-02-01' },
+      { id: 'sch_10', houseId: 'haitian', houseName: '海天', device: '廚下RO 第5道', stage: 'ST椰殼', stockId: 'STK_ST_COCO', batchQty: 1, cycleMonths: 12, lastDate: '2026-08-01', nextDate: '2027-08-01' },
+      { id: 'sch_11', houseId: 'haitian', houseName: '海天', device: '廚下RO 第6道', stage: 'ST活性碳', stockId: 'STK_ST_CARB', batchQty: 1, cycleMonths: 12, lastDate: '2026-08-01', nextDate: '2027-08-01' },
+      { id: 'sch_12', houseId: 'haitian', houseName: '海天', device: '廚下RO 第4道', stage: 'RO膜', stockId: 'STK_RO_MEM', batchQty: 1, cycleMonths: 36, lastDate: '2025-11-01', nextDate: '2028-11-01' },
+      
+      // 澎湖鎖港
+      { id: 'sch_13', houseId: 'suogang', houseName: '澎湖鎖港', device: '廚下RO 第1道', stage: 'PP-5', stockId: 'STK_PP5', batchQty: 1, cycleMonths: 4, lastDate: '2026-08-01', nextDate: '2026-11-01' },
+      { id: 'sch_14', houseId: 'suogang', houseName: '澎湖鎖港', device: '廚下RO 第2/3道', stage: 'CTO-2X', stockId: 'STK_CTO2X', batchQty: 2, cycleMonths: 6, lastDate: '2026-08-01', nextDate: '2027-02-01' },
+      { id: 'sch_15', houseId: 'suogang', houseName: '澎湖鎖港', device: '廚下RO 第5道', stage: 'ST椰殼', stockId: 'STK_ST_COCO', batchQty: 1, cycleMonths: 12, lastDate: '2026-02-01', nextDate: '2027-02-01' },
+      { id: 'sch_16', houseId: 'suogang', houseName: '澎湖鎖港', device: '廚下RO 第6道', stage: 'ST活性碳', stockId: 'STK_ST_CARB', batchQty: 1, cycleMonths: 12, lastDate: '2026-02-01', nextDate: '2027-02-01' },
+      { id: 'sch_17', houseId: 'suogang', houseName: '澎湖鎖港', device: '廚下RO 第7道', stage: 'ST麥飯石', stockId: 'STK_ST_MIN', batchQty: 1, cycleMonths: 12, lastDate: '2026-02-01', nextDate: '2027-02-01' },
+      { id: 'sch_18', houseId: 'suogang', houseName: '澎湖鎖港', device: '廚下RO 第4道', stage: 'RO膜', stockId: 'STK_RO_MEM', batchQty: 1, cycleMonths: 36, lastDate: '2024-04-01', nextDate: '2027-04-01' },
+      
+      // 澎湖阿姨家
+      { id: 'sch_19', houseId: 'aunt', houseName: '澎湖阿姨家', device: '廚下RO 第1道', stage: 'PP-5', stockId: 'STK_PP5', batchQty: 1, cycleMonths: 4, lastDate: '2026-08-01', nextDate: '2026-11-01' },
+      { id: 'sch_20', houseId: 'aunt', houseName: '澎湖阿姨家', device: '廚下RO 第2/3道', stage: 'CTO-2X', stockId: 'STK_CTO2X', batchQty: 2, cycleMonths: 6, lastDate: '2026-08-01', nextDate: '2027-02-01' },
+      { id: 'sch_21', houseId: 'aunt', houseName: '澎湖阿姨家', device: '廚下RO 第5道', stage: 'ST椰殼', stockId: 'STK_ST_COCO', batchQty: 1, cycleMonths: 12, lastDate: '2026-02-01', nextDate: '2027-02-01' },
+      { id: 'sch_22', houseId: 'aunt', houseName: '澎湖阿姨家', device: '廚下RO 第6道', stage: 'ST活性碳', stockId: 'STK_ST_CARB', batchQty: 1, cycleMonths: 12, lastDate: '2026-02-01', nextDate: '2027-02-01' },
+      { id: 'sch_23', houseId: 'aunt', houseName: '澎湖阿姨家', device: '廚下RO 第4道', stage: 'RO膜', stockId: 'STK_RO_MEM', batchQty: 1, cycleMonths: 36, lastDate: '2026-02-01', nextDate: '2029-02-01' }
+    ];
+
+    function addMonths(dateStr, months) {
+      const d = new Date(dateStr);
+      d.setMonth(d.getMonth() + parseInt(months, 10));
+      return d.toISOString().split('T')[0];
+    }
+
+    function getDaysDiff(targetDateStr) {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const target = new Date(targetDateStr);
+      target.setHours(0, 0, 0, 0);
+      return Math.round((target - today) / (1000 * 60 * 60 * 24));
+    }
+
+    // --- 主應用組件 ---
+    function App() {
+      // 驗證狀態
+      const [currentUser, setCurrentUser] = useState(null);
+      const [authLoading, setAuthLoading] = useState(true);
+      const [unauthorizedEmail, setUnauthorizedEmail] = useState(null);
+
+      const [stocks, setStocks] = useState(INITIAL_STOCKS);
+      const [schedules, setSchedules] = useState(INITIAL_SCHEDULES);
+      const [logs, setLogs] = useState([]);
+      const [syncStatus, setSyncStatus] = useState('connecting'); // 'online' | 'local' | 'connecting'
+
+      const [activeTab, setActiveTab] = useState('schedule');
+      const [filterHouse, setFilterHouse] = useState('ALL');
+      const [replaceModal, setReplaceModal] = useState(null);
+      const [transferModal, setTransferModal] = useState(null);
+      const [toast, setToast] = useState(null);
+
+      const showToast = (msg, type = 'success') => {
+        setToast({ msg, type });
+        setTimeout(() => setToast(null), 3000);
+      };
+
+      // =========================================================================
+      // 2. 監聽 Firebase 驗證狀態 (Auth State)
+      // =========================================================================
+      useEffect(() => {
+        if (!auth) {
+          setAuthLoading(false);
+          return;
+        }
+
+        const unsubscribeAuth = auth.onAuthStateChanged(async (user) => {
+          if (user) {
+            const normalizedList = ALLOWED_EMAILS.map(e => e.trim().toLowerCase());
+            const userEmail = (user.email || "").trim().toLowerCase();
+            // 若尚未修改預設範例信箱，暫時放行並顯示設定提醒；一旦填入真實信箱則嚴格執行白名單比對
+            const isPlaceholder = normalizedList.length === 1 && normalizedList[0] === "wx9950a@gmail.com";
+            
+            if (!isPlaceholder && !normalizedList.includes(userEmail)) {
+              setUnauthorizedEmail(user.email);
+              await auth.signOut();
+              setCurrentUser(null);
+              setAuthLoading(false);
+              return;
+            }
+            setUnauthorizedEmail(null);
+          }
+          setCurrentUser(user);
+          setAuthLoading(false);
+        });
+
+        return () => unsubscribeAuth();
+      }, []);
+
+      // Google 登入處理 (支援行動裝置 Popup 或 Redirect)
+      const handleGoogleLogin = async () => {
+        if (!auth || !googleProvider) {
+          showToast("Firebase Auth 尚未就緒", "error");
+          return;
+        }
+        setUnauthorizedEmail(null);
+        try {
+          await auth.signInWithPopup(googleProvider);
+        } catch (err) {
+          console.error("Google login error:", err);
+          if (err.code === "auth/popup-blocked" || err.code === "auth/popup-closed-by-user") {
+            // 若手機瀏覽器封鎖彈窗，改採轉址登入
+            auth.signInWithRedirect(googleProvider);
+          } else {
+            showToast(`登入失敗: ${err.message}`, "error");
+          }
+        }
+      };
+
+      // 登出處理
+      const handleLogout = async () => {
+        if (auth) {
+          await auth.signOut();
+          showToast("已成功登出");
+        }
+      };
+
+      // =========================================================================
+      // 3. Firestore 實時監聽 (僅在登入後觸發，符合安全規則)
+      // =========================================================================
+      useEffect(() => {
+        if (!currentUser) return; // 未登入不發起監聽
+        if (!isFirebaseReady || !db) return;
+
+        setSyncStatus('connecting');
+
+        // 監聽 1: 庫存池 (stocks)
+        const unsubStocks = db.collection('filter_stocks').onSnapshot(async (snapshot) => {
+          if (snapshot.empty) {
+            console.log("Seeding initial stocks to Firestore...");
+            const batch = db.batch();
+            INITIAL_STOCKS.forEach(item => {
+              const ref = db.collection('filter_stocks').doc(item.id);
+              batch.set(ref, item);
+            });
+            await batch.commit();
+          } else {
+            const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setStocks(data);
+            setSyncStatus('online');
+          }
+        }, (err) => {
+          console.error("Firestore stocks sync error:", err);
+          setSyncStatus('local');
+        });
+
+        // 監聽 2: 排程清單 (schedules)
+        const unsubSchedules = db.collection('maintenance_schedules').onSnapshot(async (snapshot) => {
+          if (snapshot.empty) {
+            console.log("Seeding initial schedules to Firestore...");
+            const batch = db.batch();
+            INITIAL_SCHEDULES.forEach(item => {
+              const ref = db.collection('maintenance_schedules').doc(item.id);
+              batch.set(ref, item);
+            });
+            await batch.commit();
+          } else {
+            const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setSchedules(data);
+          }
+        }, (err) => {
+          console.error("Firestore schedules sync error:", err);
+        });
+
+        // 監聽 3: 更換履歷 (logs)
+        const unsubLogs = db.collection('maintenance_logs').orderBy('timestamp', 'desc').limit(50).onSnapshot((snapshot) => {
+          const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+          setLogs(data);
+        }, (err) => {
+          console.error("Firestore logs sync error:", err);
+        });
+
+        return () => {
+          unsubStocks();
+          unsubSchedules();
+          unsubLogs();
+        };
+      }, [currentUser]);
+
+      // 統計數據
+      const stats = useMemo(() => {
+        let expired = 0;
+        let dueSoon = 0;
+        schedules.forEach(s => {
+          const diff = getDaysDiff(s.nextDate);
+          if (diff < 0) expired++;
+          else if (diff <= 30) dueSoon++;
+        });
+        return { expired, dueSoon, total: schedules.length };
+      }, [schedules]);
+
+      // =========================================================================
+      // 4. 現場更換濾心並自動扣庫存 (Transaction)
+      // =========================================================================
+      const handleConfirmReplace = async (sourceLocation, notes = '') => {
+        if (!replaceModal) return;
+        const sch = replaceModal;
+        const stock = stocks.find(s => s.id === sch.stockId);
+        if (!stock) return;
+
+        const needed = sch.batchQty;
+        const currentQty = sourceLocation === 'central' ? stock.central : (stock.locations[sourceLocation] || 0);
+
+        if (currentQty < needed) {
+          showToast(`庫存不足！該位置僅有 ${currentQty} ${stock.unit}，需要 ${needed} ${stock.unit}`, 'error');
+          return;
+        }
+
+        const todayStr = new Date().toISOString().split('T')[0];
+        const nextDateStr = addMonths(todayStr, sch.cycleMonths);
+
+        if (syncStatus === 'online' && db) {
+          try {
+            await db.runTransaction(async (transaction) => {
+              const stockRef = db.collection('filter_stocks').doc(stock.id);
+              const scheduleRef = db.collection('maintenance_schedules').doc(sch.id);
+              const newLogRef = db.collection('maintenance_logs').doc();
+
+              const stockDoc = await transaction.get(stockRef);
+              if (!stockDoc.exists) throw new Error("庫存資料不存在！");
+
+              const sData = stockDoc.data();
+              let newCentral = sData.central;
+              let newLocations = { ...sData.locations };
+
+              if (sourceLocation === 'central') {
+                if (newCentral < needed) throw new Error("中央庫存不足！");
+                newCentral -= needed;
+              } else {
+                if ((newLocations[sourceLocation] || 0) < needed) throw new Error("現場庫存不足！");
+                newLocations[sourceLocation] -= needed;
+              }
+
+              transaction.update(stockRef, { central: newCentral, locations: newLocations });
+              transaction.update(scheduleRef, {
+                lastDate: todayStr,
+                nextDate: nextDateStr
+              });
+              transaction.set(newLogRef, {
+                timestamp: new Date().toLocaleString(),
+                operatorEmail: currentUser?.email || 'unknown',
+                houseName: sch.houseName,
+                device: sch.device,
+                stage: sch.stage,
+                stockName: stock.name,
+                qty: needed,
+                source: sourceLocation === 'central' ? '中央待入庫' : INITIAL_HOUSES.find(h => h.id === sourceLocation)?.name,
+                notes: notes || '例行更換'
+              });
+            });
+
+            setReplaceModal(null);
+            showToast(`☁️ 雲端同步完成！成功更換並扣庫存，下次預計 ${nextDateStr}`);
+          } catch (err) {
+            console.error("Replace transaction failed:", err);
+            showToast(`更換失敗: ${err.message}`, 'error');
+          }
+        }
+      };
+
+      // =========================================================================
+      // 5. 跨房屋調撥庫存 (Transaction)
+      // =========================================================================
+      const handleTransferStock = async (stockId, fromLoc, toLoc, qty) => {
+        const amount = parseInt(qty, 10);
+        if (isNaN(amount) || amount <= 0) {
+          showToast('請輸入有效數量', 'error');
+          return;
+        }
+
+        const stock = stocks.find(s => s.id === stockId);
+        if (!stock) return;
+
+        const fromQty = fromLoc === 'central' ? stock.central : (stock.locations[fromLoc] || 0);
+        if (fromQty < amount) {
+          showToast('轉出點庫存不足！', 'error');
+          return;
+        }
+
+        if (syncStatus === 'online' && db) {
+          try {
+            await db.runTransaction(async (transaction) => {
+              const stockRef = db.collection('filter_stocks').doc(stockId);
+              const doc = await transaction.get(stockRef);
+              if (!doc.exists) throw new Error("耗材不存在！");
+
+              const s = doc.data();
+              let newCentral = s.central;
+              let newLocs = { ...s.locations };
+
+              if (fromLoc === 'central') newCentral -= amount;
+              else newLocs[fromLoc] = (newLocs[fromLoc] || 0) - amount;
+
+              if (toLoc === 'central') newCentral += amount;
+              else newLocs[toLoc] = (newLocs[toLoc] || 0) + amount;
+
+              transaction.update(stockRef, { central: newCentral, locations: newLocs });
+            });
+
+            setTransferModal(null);
+            showToast(`☁️ 雲端調撥成功！${stock.name} x${amount} 已更新`);
+          } catch (err) {
+            console.error("Transfer failed:", err);
+            showToast(`調撥失敗: ${err.message}`, 'error');
+          }
+        }
+      };
+
+      const filteredSchedules = useMemo(() => {
+        return schedules
+          .filter(s => filterHouse === 'ALL' || s.houseId === filterHouse)
+          .sort((a, b) => new Date(a.nextDate) - new Date(b.nextDate));
+      }, [schedules, filterHouse]);
+
+      // --- 驗證中狀態 ---
+      if (authLoading) {
+        return (
+          <div className="min-h-screen flex flex-col items-center justify-center p-4">
+            <div className="w-10 h-10 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mb-3"></div>
+            <p className="text-xs text-slate-500 font-medium">系統安全連線中...</p>
+          </div>
+        );
+      }
+
+      // --- 未登入：Google 授權登入畫面 ---
+      if (!currentUser) {
+        return (
+          <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-gradient-to-b from-slate-100 to-slate-200">
+            <div className="w-full max-w-sm bg-white rounded-2xl shadow-xl p-6 text-center border border-slate-200">
+              <div className="w-16 h-16 bg-blue-50 text-3xl rounded-2xl flex items-center justify-center mx-auto mb-4 border border-blue-100 shadow-inner">
+                🚰
+              </div>
+              <h1 className="text-xl font-extrabold text-slate-800 tracking-tight">
+                四屋淨水設備與耗材管理
+              </h1>
+              <p className="text-xs text-slate-500 mt-1.5 mb-5 leading-relaxed">
+                交響樂 · 海天 · 澎湖鎖港 · 澎湖阿姨家<br/>
+                僅限授權白名單的 Google 帳號登入
+              </p>
+
+              {unauthorizedEmail && (
+                <div className="mb-4 p-3 rounded-xl bg-rose-50 border border-rose-200 text-left">
+                  <p className="text-xs font-bold text-rose-700 flex items-center gap-1">
+                    <span>🚫</span> 存取被拒絕（非授權帳號）
+                  </p>
+                  <p className="text-[11px] text-rose-600 mt-1 break-all">
+                    帳號 <span className="font-semibold underline">{unauthorizedEmail}</span> 不在白名單中，系統已自動登出。請改用授權的 Gmail 登入。
+                  </p>
+                </div>
+              )}
+
+              {/* Google 登入按鈕 */}
+              <button
+                onClick={handleGoogleLogin}
+                className="w-full flex items-center justify-center gap-3 bg-white border border-slate-300 hover:border-slate-400 active:bg-slate-50 py-3 px-4 rounded-xl shadow-sm text-sm font-semibold text-slate-700 transition"
+              >
+                <svg className="w-5 h-5" viewBox="0 0 24 24">
+                  <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.8-2.4 3.66v3.05h3.88c2.27-2.09 3.66-5.17 3.66-9.15z"/>
+                  <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.76-2.11-6.71-4.96H1.27v3.13C3.25 21.3 7.35 24 12 24z"/>
+                  <path fill="#FBBC05" d="M5.29 14.24c-.25-.72-.38-1.49-.38-2.24s.13-1.52.38-2.24V6.63H1.27C.46 8.24 0 10.06 0 12s.46 3.76 1.27 5.37l4.02-3.13z"/>
+                  <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.35 0 3.25 2.7 1.27 6.63l4.02 3.13c.95-2.85 3.59-4.96 6.71-4.96z"/>
+                </svg>
+                <span>使用 Google 帳號登入</span>
+              </button>
+
+              <div className="mt-6 pt-4 border-t border-slate-100 flex items-center justify-center gap-2 text-[11px] text-slate-400">
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                <span>Firestore Cloud AES-256 加密保護</span>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      // --- 已登入：主應用介面 ---
+      return (
+        <div className="max-w-md mx-auto pb-24 min-h-screen bg-slate-50 flex flex-col shadow-lg">
+          {/* 頂部標題列 */}
+          <header className="bg-slate-800 text-white p-4 sticky top-0 z-30 shadow-md">
+            <div className="flex justify-between items-center mb-2">
+              <div>
+                <h1 className="text-lg font-bold tracking-wide flex items-center gap-2">
+                  <span>🚰</span> 淨水器耗材管理
+                </h1>
+                <div className="flex items-center gap-1.5 mt-0.5">
+                  <span className={`inline-block w-2 h-2 rounded-full ${
+                    syncStatus === 'online' ? 'bg-emerald-400 animate-pulse' :
+                    syncStatus === 'connecting' ? 'bg-amber-400' : 'bg-slate-400'
+                  }`} />
+                  <p className="text-[11px] text-slate-300">
+                    {syncStatus === 'online' ? 'Firestore 雲端同步中' : '連線中...'}
+                  </p>
+                </div>
+              </div>
+
+              {/* 使用者資訊與登出按鈕 */}
+              <div className="flex items-center gap-2">
+                {currentUser.photoURL ? (
+                  <img src={currentUser.photoURL} alt="User" className="w-7 h-7 rounded-full border border-slate-600" />
+                ) : (
+                  <div className="w-7 h-7 rounded-full bg-slate-600 flex items-center justify-center text-xs font-bold">
+                    {currentUser.email ? currentUser.email[0].toUpperCase() : 'U'}
+                  </div>
+                )}
+                <button
+                  onClick={handleLogout}
+                  title="登出帳號"
+                  className="bg-slate-700 hover:bg-slate-600 active:scale-95 text-slate-300 hover:text-white px-2 py-1 rounded text-xs transition"
+                >
+                  登出
+                </button>
+              </div>
+            </div>
+
+            {/* 警報摘要列 */}
+            <div className="flex justify-between items-center pt-1 border-t border-slate-700/60 text-xs">
+              <span className="text-slate-400 text-[11px] truncate max-w-[180px]">
+                {currentUser.email}
+              </span>
+              <div className="flex items-center gap-1.5">
+                {stats.expired > 0 && (
+                  <span className="bg-rose-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold animate-pulse">
+                    逾期 {stats.expired}
+                  </span>
+                )}
+                {stats.dueSoon > 0 && (
+                  <span className="bg-amber-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold">
+                    即期 {stats.dueSoon}
+                  </span>
+                )}
+              </div>
+            </div>
+          </header>
+
+          {/* 白名單尚未設定提醒橫幅 */}
+          {ALLOWED_EMAILS.length === 1 && ALLOWED_EMAILS[0] === "wx9950a@gmail.com" && (
+            <div className="bg-amber-50 border-b border-amber-200 px-3 py-2 text-[11px] text-amber-800 flex items-start gap-1.5">
+              <span>⚠️</span>
+              <span>
+                <strong>安全提醒：</strong>目前白名單仍為預設範例，請將 <code className="bg-amber-100 px-1 rounded">index.html</code> 與 <code className="bg-amber-100 px-1 rounded">firestore.rules</code> 中的 <code className="bg-amber-100 px-1 rounded">wx9950a@gmail.com</code> 替換為你的 Gmail（<span className="underline font-semibold">{currentUser.email}</span>）。
+              </span>
+            </div>
+          )}
+
+          {/* Toast 提示 */}
+          {toast && (
+            <div className={`fixed top-20 left-1/2 transform -translate-x-1/2 z-50 px-4 py-2 rounded-lg text-sm font-medium shadow-lg transition-all ${
+              toast.type === 'error' ? 'bg-rose-600 text-white' : 'bg-emerald-600 text-white'
+            }`}>
+              {toast.msg}
+            </div>
+          )}
+
+          {/* 主要內容切換 */}
+          <main className="p-3 flex-1">
+            {/* TAB 1: 更換排程看板 */}
+            {activeTab === 'schedule' && (
+              <div>
+                {/* 房屋篩選 Chip */}
+                <div className="flex gap-1.5 overflow-x-auto pb-2 mb-3 no-scrollbar text-xs">
+                  <button
+                    onClick={() => setFilterHouse('ALL')}
+                    className={`px-3 py-1.5 rounded-full whitespace-nowrap font-medium transition ${
+                      filterHouse === 'ALL' ? 'bg-slate-800 text-white' : 'bg-white text-slate-600 border border-slate-200'
+                    }`}
+                  >
+                    全部房屋 ({schedules.length})
+                  </button>
+                  {INITIAL_HOUSES.map(h => (
+                    <button
+                      key={h.id}
+                      onClick={() => setFilterHouse(h.id)}
+                      className={`px-3 py-1.5 rounded-full whitespace-nowrap font-medium transition ${
+                        filterHouse === h.id ? 'bg-blue-600 text-white' : 'bg-white text-slate-600 border border-slate-200'
+                      }`}
+                    >
+                      {h.name}
+                    </button>
+                  ))}
+                </div>
+
+                {/* 排程卡片列表 */}
+                <div className="space-y-2.5">
+                  {filteredSchedules.map(sch => {
+                    const days = getDaysDiff(sch.nextDate);
+                    const stock = stocks.find(s => s.id === sch.stockId);
+                    const houseStock = stock?.locations[sch.houseId] || 0;
+                    const centralStock = stock?.central || 0;
+                    
+                    let badgeClass = "bg-emerald-50 text-emerald-700 border-emerald-200";
+                    let badgeText = `剩餘 ${days} 天`;
+                    if (days < 0) {
+                      badgeClass = "bg-rose-50 text-rose-700 border-rose-200 font-bold";
+                      badgeText = `已逾期 ${Math.abs(days)} 天`;
+                    } else if (days <= 30) {
+                      badgeClass = "bg-amber-50 text-amber-700 border-amber-200 font-semibold";
+                      badgeText = `即將到期 (${days}天)`;
+                    }
+
+                    return (
+                      <div key={sch.id} className="bg-white rounded-xl p-3.5 border border-slate-200 shadow-sm relative overflow-hidden">
+                        <div className={`absolute left-0 top-0 bottom-0 w-1.5 ${
+                          days < 0 ? 'bg-rose-500' : days <= 30 ? 'bg-amber-400' : 'bg-emerald-400'
+                        }`} />
+
+                        <div className="flex justify-between items-start pl-1 mb-1.5">
+                          <div>
+                            <span className="text-[11px] font-semibold text-slate-500 bg-slate-100 px-2 py-0.5 rounded">
+                              {sch.houseName} · {sch.device}
+                            </span>
+                            <h3 className="font-bold text-slate-800 text-base mt-1">
+                              {sch.stage}
+                            </h3>
+                          </div>
+                          <span className={`text-xs px-2 py-0.5 rounded-full border ${badgeClass}`}>
+                            {badgeText}
+                          </span>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2 text-xs text-slate-600 bg-slate-50 p-2 rounded-lg mb-3 pl-2">
+                          <div>
+                            <span className="text-slate-400">下次到期：</span>
+                            <span className="font-semibold">{sch.nextDate}</span>
+                          </div>
+                          <div>
+                            <span className="text-slate-400">更換週期：</span>
+                            <span>{sch.cycleMonths} 個月/次</span>
+                          </div>
+                          <div>
+                            <span className="text-slate-400">現場存量：</span>
+                            <span className={houseStock < sch.batchQty ? 'text-rose-500 font-bold' : 'font-semibold text-slate-700'}>
+                              {houseStock} {stock?.unit}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-slate-400">中央在庫：</span>
+                            <span className="font-semibold text-slate-700">{centralStock} {stock?.unit}</span>
+                          </div>
+                        </div>
+
+                        <button
+                          onClick={() => setReplaceModal(sch)}
+                          className="w-full bg-slate-800 hover:bg-slate-700 active:scale-[0.98] transition text-white py-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 shadow-sm"
+                        >
+                          <span>🔧 已在現場完成更換 (扣庫存)</span>
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* TAB 2: 庫存總覽與調撥 */}
+            {activeTab === 'stock' && (
+              <div className="space-y-3">
+                <div className="flex justify-between items-center mb-1">
+                  <h2 className="text-sm font-bold text-slate-700">各據點耗材庫存池</h2>
+                  <span className="text-xs text-slate-400">共 {stocks.length} 款耗材</span>
+                </div>
+
+                {stocks.map(stk => {
+                  const total = stk.central + Object.values(stk.locations).reduce((a, b) => a + b, 0);
+                  const isLow = total < stk.safety;
+
+                  return (
+                    <div key={stk.id} className="bg-white rounded-xl p-3.5 border border-slate-200 shadow-sm">
+                      <div className="flex justify-between items-start mb-2">
+                        <div>
+                          <h3 className="font-bold text-slate-800 text-sm">{stk.name}</h3>
+                          <p className="text-xs text-slate-400">{stk.spec}</p>
+                        </div>
+                        <div className="text-right">
+                          <span className={`text-base font-extrabold ${isLow ? 'text-rose-600' : 'text-slate-800'}`}>
+                            {total}
+                          </span>
+                          <span className="text-xs text-slate-500 ml-1">{stk.unit}</span>
+                          {isLow && (
+                            <p className="text-[10px] text-rose-500 font-bold">低於安全水位({stk.safety})</p>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-5 gap-1 text-center bg-slate-50 p-2 rounded-lg text-xs mb-2.5">
+                        <div className="border-r border-slate-200">
+                          <span className="text-slate-400 block text-[10px]">待入庫</span>
+                          <span className="font-bold text-slate-700">{stk.central}</span>
+                        </div>
+                        <div className="border-r border-slate-200">
+                          <span className="text-slate-400 block text-[10px]">交響樂</span>
+                          <span className="font-bold text-slate-700">{stk.locations.jiao || 0}</span>
+                        </div>
+                        <div className="border-r border-slate-200">
+                          <span className="text-slate-400 block text-[10px]">海天</span>
+                          <span className="font-bold text-slate-700">{stk.locations.haitian || 0}</span>
+                        </div>
+                        <div className="border-r border-slate-200">
+                          <span className="text-slate-400 block text-[10px]">鎖港</span>
+                          <span className="font-bold text-slate-700">{stk.locations.suogang || 0}</span>
+                        </div>
+                        <div>
+                          <span className="text-slate-400 block text-[10px]">阿姨家</span>
+                          <span className="font-bold text-slate-700">{stk.locations.aunt || 0}</span>
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={() => setTransferModal(stk)}
+                        className="w-full bg-blue-50 text-blue-700 hover:bg-blue-100 py-1.5 rounded-lg text-xs font-medium border border-blue-200 flex items-center justify-center gap-1"
+                      >
+                        <span>⇄ 移動 / 調撥庫存</span>
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* TAB 3: 澎湖返鄉備料智慧清單 */}
+            {activeTab === 'penghu' && (
+              <div className="space-y-3">
+                <div className="bg-blue-900 text-white p-4 rounded-xl shadow-sm">
+                  <h2 className="font-bold text-base flex items-center gap-1.5">
+                    <span>✈️</span> 澎湖返鄉備料試算
+                  </h2>
+                  <p className="text-xs text-blue-200 mt-1">
+                    自動分析 2027年2月底前 澎湖鎖港與阿姨家到期的濾芯，扣除現場存量，計算需從本島攜帶的數量。
+                  </p>
+                </div>
+
+                <div className="bg-white rounded-xl p-3 border border-slate-200 space-y-2">
+                  <div className="text-xs font-bold text-slate-700 pb-1 border-b border-slate-100 flex justify-between">
+                    <span>品項規格</span>
+                    <span>建議攜帶總數</span>
+                  </div>
+
+                  {stocks.filter(s => ['STK_PP5', 'STK_CTO2X', 'STK_ST_COCO', 'STK_ST_CARB', 'STK_ST_MIN', 'STK_RO_MEM'].includes(s.id)).map(stk => {
+                    const targetDate = new Date('2027-02-28');
+                    let needTotal = 0;
+                    schedules.forEach(sch => {
+                      if ((sch.houseId === 'suogang' || sch.houseId === 'aunt') && sch.stockId === stk.id) {
+                        if (new Date(sch.nextDate) <= targetDate) {
+                          needTotal += sch.batchQty;
+                        }
+                      }
+                    });
+
+                    const localTotal = (stk.locations.suogang || 0) + (stk.locations.aunt || 0);
+                    const carryNeeded = Math.max(0, needTotal - localTotal);
+
+                    return (
+                      <div key={stk.id} className="flex justify-between items-center py-1.5 border-b border-slate-50 text-xs">
+                        <div>
+                          <span className="font-semibold text-slate-800">{stk.name}</span>
+                          <span className="text-[10px] text-slate-400 block">
+                            兩屋需換 {needTotal} 支 · 現場存 {localTotal} 支
+                          </span>
+                        </div>
+                        <div className="text-right">
+                          <span className={`text-sm font-bold px-2 py-0.5 rounded ${
+                            carryNeeded > 0 ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-500'
+                          }`}>
+                            帶 {carryNeeded} {stk.unit}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* TAB 4: 更換歷史履歷 */}
+            {activeTab === 'history' && (
+              <div className="space-y-2">
+                <div className="flex justify-between items-center mb-1">
+                  <h2 className="text-sm font-bold text-slate-700">雲端更換日誌</h2>
+                  <span className="text-xs text-slate-400">{logs.length} 筆紀錄</span>
+                </div>
+
+                {logs.length === 0 ? (
+                  <div className="text-center py-12 text-slate-400 text-xs">
+                    目前尚無更換紀錄，更換後將即時同步至雲端。
+                  </div>
+                ) : (
+                  logs.map(log => (
+                    <div key={log.id} className="bg-white p-3 rounded-xl border border-slate-200 text-xs space-y-1">
+                      <div className="flex justify-between font-bold text-slate-800">
+                        <span>{log.houseName} · {log.stage}</span>
+                        <span className="text-slate-400 font-normal">{log.timestamp ? log.timestamp.split(' ')[0] : ''}</span>
+                      </div>
+                      <div className="text-slate-600 flex justify-between">
+                        <span>耗用：{log.stockName} x{log.qty}</span>
+                        <span className="text-slate-400">來源：{log.source}</span>
+                      </div>
+                      {log.notes && (
+                        <p className="text-[11px] text-slate-500 bg-slate-50 p-1.5 rounded mt-1">
+                          備註：{log.notes}
+                        </p>
+                      )}
+                      {log.operatorEmail && (
+                        <p className="text-[10px] text-slate-400 text-right">
+                          操作人：{log.operatorEmail}
+                        </p>
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </main>
+
+          {/* 彈窗 1: 更換確認 Modal */}
+          {replaceModal && (
+            <div className="fixed inset-0 bg-black/60 z-50 flex items-end sm:items-center justify-center p-3">
+              <div className="bg-white w-full max-w-sm rounded-2xl p-4 space-y-3.5 shadow-2xl animate-fade-in">
+                <div className="flex justify-between items-center border-b pb-2">
+                  <h3 className="font-bold text-slate-800 text-base">確認更換濾心</h3>
+                  <button onClick={() => setReplaceModal(null)} className="text-slate-400 hover:text-slate-600 text-lg">✕</button>
+                </div>
+
+                <div className="text-xs space-y-1.5 bg-slate-50 p-3 rounded-xl">
+                  <p><span className="text-slate-400">地點：</span><span className="font-semibold">{replaceModal.houseName} ({replaceModal.device})</span></p>
+                  <p><span className="text-slate-400">道數規格：</span><span className="font-bold text-blue-600">{replaceModal.stage}</span></p>
+                  <p><span className="text-slate-400">預計消耗：</span><span className="font-bold text-rose-600">{replaceModal.batchQty} 支</span></p>
+                </div>
+
+                <div>
+                  <label className="text-xs font-semibold text-slate-700 block mb-1">從哪裡的庫存扣除？</label>
+                  <select id="sourceLocationSelect" className="w-full text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-lg font-medium">
+                    <option value={replaceModal.houseId}>
+                      {replaceModal.houseName} 現場庫存 (現有 {stocks.find(s => s.id === replaceModal.stockId)?.locations[replaceModal.houseId] || 0} 支)
+                    </option>
+                    <option value="central">
+                      中央待入庫存 (現有 {stocks.find(s => s.id === replaceModal.stockId)?.central || 0} 支)
+                    </option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="text-xs font-semibold text-slate-700 block mb-1">更換備註 (選填)</label>
+                  <input
+                    type="text"
+                    id="replaceNotesInput"
+                    placeholder="如：外觀泥沙沉積、TDS=12 等"
+                    className="w-full text-xs p-2 bg-slate-50 border border-slate-300 rounded-lg"
+                  />
+                </div>
+
+                <div className="flex gap-2 pt-1">
+                  <button
+                    onClick={() => setReplaceModal(null)}
+                    className="flex-1 py-2.5 rounded-lg border border-slate-200 text-xs font-medium text-slate-600"
+                  >
+                    取消
+                  </button>
+                  <button
+                    onClick={() => {
+                      const sel = document.getElementById('sourceLocationSelect').value;
+                      const notes = document.getElementById('replaceNotesInput').value;
+                      handleConfirmReplace(sel, notes);
+                    }}
+                    className="flex-1 py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-md"
+                  >
+                    確認完成並同步
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 彈窗 2: 庫存調撥 Modal */}
+          {transferModal && (
+            <div className="fixed inset-0 bg-black/60 z-50 flex items-end sm:items-center justify-center p-3">
+              <div className="bg-white w-full max-w-sm rounded-2xl p-4 space-y-3.5 shadow-2xl">
+                <div className="flex justify-between items-center border-b pb-2">
+                  <h3 className="font-bold text-slate-800 text-base">耗材調撥 / 移動</h3>
+                  <button onClick={() => setTransferModal(null)} className="text-slate-400 hover:text-slate-600 text-lg">✕</button>
+                </div>
+
+                <p className="text-xs text-slate-500">
+                  調撥品項：<span className="font-bold text-slate-800">{transferModal.name}</span> ({transferModal.spec})
+                </p>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[11px] font-semibold text-slate-600 block mb-1">轉出點 (From)</label>
+                    <select id="transferFromSelect" className="w-full text-xs p-2 bg-slate-50 border border-slate-300 rounded-lg">
+                      <option value="central">中央待入庫 ({transferModal.central})</option>
+                      <option value="jiao">交響樂 ({transferModal.locations.jiao || 0})</option>
+                      <option value="haitian">海天 ({transferModal.locations.haitian || 0})</option>
+                      <option value="suogang">澎湖鎖港 ({transferModal.locations.suogang || 0})</option>
+                      <option value="aunt">澎湖阿姨家 ({transferModal.locations.aunt || 0})</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-[11px] font-semibold text-slate-600 block mb-1">轉入點 (To)</label>
+                    <select id="transferToSelect" className="w-full text-xs p-2 bg-slate-50 border border-slate-300 rounded-lg">
+                      <option value="suogang">澎湖鎖港</option>
+                      <option value="aunt">澎湖阿姨家</option>
+                      <option value="jiao">交響樂</option>
+                      <option value="haitian">海天</option>
+                      <option value="central">中央待入庫</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-semibold text-slate-600 block mb-1">調撥數量 ({transferModal.unit})</label>
+                  <input
+                    type="number"
+                    id="transferQtyInput"
+                    defaultValue="1"
+                    min="1"
+                    className="w-full text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-lg font-bold"
+                  />
+                </div>
+
+                <div className="flex gap-2 pt-1">
+                  <button
+                    onClick={() => setTransferModal(null)}
+                    className="flex-1 py-2.5 rounded-lg border border-slate-200 text-xs font-medium text-slate-600"
+                  >
+                    取消
+                  </button>
+                  <button
+                    onClick={() => {
+                      const fromLoc = document.getElementById('transferFromSelect').value;
+                      const toLoc = document.getElementById('transferToSelect').value;
+                      const qty = document.getElementById('transferQtyInput').value;
+                      if (fromLoc === toLoc) {
+                        showToast('轉出點與轉入點不能相同', 'error');
+                        return;
+                      }
+                      handleTransferStock(transferModal.id, fromLoc, toLoc, qty);
+                    }}
+                    className="flex-1 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold shadow-md"
+                  >
+                    確認調撥
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 底部導航列 (Bottom Navigation) */}
+          <nav className="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-white border-t border-slate-200 flex justify-around py-2 z-40 shadow-lg">
+            <button
+              onClick={() => setActiveTab('schedule')}
+              className={`flex flex-col items-center gap-0.5 text-[10px] font-medium transition ${
+                activeTab === 'schedule' ? 'text-blue-600 font-bold' : 'text-slate-400'
+              }`}
+            >
+              <span className="text-lg">📋</span>
+              <span>維護排程</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('stock')}
+              className={`flex flex-col items-center gap-0.5 text-[10px] font-medium transition ${
+                activeTab === 'stock' ? 'text-blue-600 font-bold' : 'text-slate-400'
+              }`}
+            >
+              <span className="text-lg">📦</span>
+              <span>耗材庫存</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('penghu')}
+              className={`flex flex-col items-center gap-0.5 text-[10px] font-medium transition ${
+                activeTab === 'penghu' ? 'text-blue-600 font-bold' : 'text-slate-400'
+              }`}
+            >
+              <span className="text-lg">✈️</span>
+              <span>澎湖備料</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('history')}
+              className={`flex flex-col items-center gap-0.5 text-[10px] font-medium transition ${
+                activeTab === 'history' ? 'text-blue-600 font-bold' : 'text-slate-400'
+              }`}
+            >
+              <span className="text-lg">📝</span>
+              <span>更換日誌</span>
+            </button>
+          </nav>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
